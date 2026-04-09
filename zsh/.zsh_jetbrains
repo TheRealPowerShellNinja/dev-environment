@@ -1,0 +1,380 @@
+# @module: zsh_jetbrains
+# @version: 0.2.0
+# @updated: 2026-04-08
+# @purpose: JetBrains IDE launchers, inspection helpers, and safe maintenance commands.
+
+# ===============================================
+# ~/.zsh_jetbrains — JetBrains IDE helpers
+#
+# Purpose:
+# - Launch IntelliJ, PyCharm, and WebStorm in controlled training/project roots
+# - Inspect JetBrains-maintained state files such as trusted paths and recents
+# - Perform carefully guarded maintenance operations for troubleshooting
+#
+# Design notes:
+# - Public functions are documented with PowerShell-style help metadata so they
+#   appear cleanly in fn_list / fn_help.
+# - Internal helpers use a leading underscore and are intentionally excluded from
+#   discoverability output.
+# - Destructive operations require interactive confirmation with an exact,
+#   IDE-specific all-caps token such as PURGE_INTELLIJ.
+# - We prefer letting JetBrains write trust decisions itself rather than manually
+#   editing trust files, because JetBrains may perform additional internal work
+#   beyond the visible XML changes.
+#
+# Current IDE roots:
+# - IntelliJ:
+#     ~/dev/training/java
+#     ~/dev/projects/java
+# - PyCharm:
+#     ~/dev/training/python
+#     ~/dev/projects/python
+# - WebStorm:
+#     ~/dev/training/web
+#     ~/dev/projects/web
+#
+# Current maintenance scope:
+# - Trust inspection
+# - Recents inspection
+# - Recents purge
+# - Workspace purge
+#
+# Future ideas:
+# - Trust bootstrap helpers
+# - Trust inspection for all IDEs in one report
+# - Optional logging for destructive maintenance actions
+# ===============================================
+
+# ---------- Colors ----------
+# These are used to make destructive prompts visually obvious.
+RED="%F{red}"
+YELLOW="%F{yellow}"
+GREEN="%F{green}"
+RESET="%f"
+
+# ===============================================
+# Internal helper: Resolve JetBrains config root
+#
+# Why this exists:
+# - JetBrains stores config under versioned directories such as:
+#     IntelliJIdea2026.1
+#     PyCharm2026.1
+#     WebStorm2026.1
+# - Hardcoding the full versioned path would make the functions brittle.
+# - This helper resolves the newest matching directory dynamically.
+#
+# Input:
+# - intellij | pycharm | webstorm
+#
+# Output:
+# - Absolute path to the latest matching JetBrains config directory
+# ===============================================
+_jb_resolve_path() {
+  local ide="$1"
+  local base="$HOME/Library/Application Support/JetBrains"
+  local pattern
+
+  case "$ide" in
+    intellij) pattern="IntelliJIdea"* ;;
+    pycharm)  pattern="PyCharm"* ;;
+    webstorm) pattern="WebStorm"* ;;
+    *)
+      echo "❌ Unknown IDE: $ide"
+      return 1
+      ;;
+  esac
+
+  ls -dt "$base"/$pattern 2>/dev/null | head -n 1
+}
+
+# ===============================================
+# Internal helper: Validate supported IDE name
+#
+# Why this exists:
+# - Public functions should fail early and clearly if the IDE name is not one of
+#   the expected identifiers.
+# ===============================================
+_jb_validate_ide() {
+  local ide="$1"
+  case "$ide" in
+    intellij|pycharm|webstorm) return 0 ;;
+    *)
+      echo "❌ Unknown IDE: $ide"
+      echo "   Expected: intellij | pycharm | webstorm"
+      return 1
+      ;;
+  esac
+}
+
+# ===============================================
+# Internal helper: Print a destructive-action warning block
+#
+# Why this exists:
+# - Centralizes the visual warning format
+# - Makes all destructive commands feel consistent and serious
+# ===============================================
+_jb_warn_destructive() {
+  local ide="$1"
+  local action="$2"
+  local target="$3"
+
+  echo "${RED}"
+  echo "⚠️  DESTRUCTIVE ACTION"
+  echo "IDE    : $ide"
+  echo "Action : $action"
+  echo "Target : $target"
+  echo "${RESET}"
+}
+
+# ===============================================
+# Internal helper: Interactive purge confirmation
+#
+# Behavior:
+# - Requires exact IDE-specific token:
+#     PURGE_INTELLIJ
+#     PURGE_PYCHARM
+#     PURGE_WEBSTORM
+# - Allows one retry for a close-but-wrong token that starts with PURGE_
+# - Aborts immediately for casual or clearly invalid input
+#
+# Why this exists:
+# - Adds deliberate friction to destructive operations
+# - Reduces the chance of accidental state deletion
+# ===============================================
+_jb_confirm_purge() {
+  local ide_upper="$1"
+  local expected="PURGE_${ide_upper}"
+  local attempts=0
+
+  while (( attempts < 2 )); do
+    local input
+    read "input?Type ${expected} to continue: "
+
+    if [[ "$input" == "$expected" ]]; then
+      return 0
+    fi
+
+    if [[ "$input" == PURGE_* ]]; then
+      echo "${YELLOW}Close, but not exact. Nothing was changed.${RESET}"
+      ((attempts++))
+      continue
+    fi
+
+    echo "${YELLOW}Aborted. Confirmation token invalid.${RESET}"
+    return 1
+  done
+
+  echo "${YELLOW}Aborted after multiple incorrect attempts.${RESET}"
+  return 1
+}
+
+# ===============================================
+# Internal helper: Verify a file was truncated to zero length
+# ===============================================
+_jb_verify_empty_file() {
+  local file="$1"
+  [[ -f "$file" && ! -s "$file" ]]
+}
+
+# ===============================================
+# Internal helper: Verify a directory contains no entries
+# ===============================================
+_jb_verify_empty_dir() {
+  local dir="$1"
+  [[ -d "$dir" && -z "$(ls -A "$dir" 2>/dev/null)" ]]
+}
+
+# @synopsis: Show the trusted-paths XML for a JetBrains IDE
+# @description: Resolves the current versioned JetBrains configuration directory for
+#   the requested IDE and formats its trusted-paths.xml file with xmllint.
+# @parameter ide: Supported values are intellij, pycharm, or webstorm.
+# @example: jb_trust_show intellij
+# @example: jb_trust_show pycharm
+# @notes: This is read-only inspection. Trust decisions should normally be written
+#   by JetBrains itself through the IDE trust flow.
+jb_trust_show() {
+  local ide="$1"
+  _jb_validate_ide "$ide" || return 1
+
+  local root
+  root="$(_jb_resolve_path "$ide")" || return 1
+
+  local path="$root/options/trusted-paths.xml"
+
+  [[ -f "$path" ]] || {
+    echo "${YELLOW}No trusted paths file found for $ide${RESET}"
+    return 1
+  }
+
+  xmllint --format "$path"
+}
+
+# @synopsis: Show the recentProjects XML for a JetBrains IDE
+# @description: Resolves the current versioned JetBrains configuration directory for
+#   the requested IDE and displays the recentProjects.xml file. If xmllint cannot
+#   format the file, the raw file contents are shown instead.
+# @parameter ide: Supported values are intellij, pycharm, or webstorm.
+# @example: jb_recents_show intellij
+# @example: jb_recents_show webstorm
+# @notes: This is read-only inspection of JetBrains recents state.
+jb_recents_show() {
+  local ide="$1"
+  _jb_validate_ide "$ide" || return 1
+
+  local root
+  root="$(_jb_resolve_path "$ide")" || return 1
+
+  local path="$root/options/recentProjects.xml"
+
+  [[ -f "$path" ]] || {
+    echo "${YELLOW}No recents file found for $ide${RESET}"
+    return 1
+  }
+
+  xmllint --format "$path" 2>/dev/null || cat "$path"
+}
+
+# @synopsis: Purge the recentProjects XML for a JetBrains IDE
+# @description: Clears the recentProjects.xml file for the requested IDE after an
+#   interactive, IDE-specific confirmation prompt. The function then verifies that
+#   the file exists and is empty.
+# @parameter ide: Supported values are intellij, pycharm, or webstorm.
+# @example: jb_recents_purge intellij
+# @example: jb_recents_purge pycharm
+# @notes: This is a destructive maintenance command. It does not modify trust state.
+jb_recents_purge() {
+  local ide="$1"
+  _jb_validate_ide "$ide" || return 1
+
+  local ide_upper="${(U)ide}"
+  local root
+  root="$(_jb_resolve_path "$ide")" || return 1
+
+  local path="$root/options/recentProjects.xml"
+
+  [[ -f "$path" ]] || {
+    echo "${YELLOW}No recents file found for $ide${RESET}"
+    return 1
+  }
+
+  _jb_warn_destructive "$ide" "Purge recents" "$path"
+  sleep 1
+
+  _jb_confirm_purge "$ide_upper" || return 1
+
+  : > "$path"
+
+  if _jb_verify_empty_file "$path"; then
+    echo "${GREEN}✅ Recents purged${RESET}"
+    echo "${GREEN}✅ Verified: file is empty${RESET}"
+  else
+    echo "${RED}❌ Verification failed: file is not empty${RESET}"
+    return 1
+  fi
+}
+
+# @synopsis: Purge the workspace cache directory for a JetBrains IDE
+# @description: Removes the contents of the workspace directory for the requested IDE
+#   after an interactive, IDE-specific confirmation prompt. The function then verifies
+#   that the directory exists and is empty.
+# @parameter ide: Supported values are intellij, pycharm, or webstorm.
+# @example: jb_workspace_purge intellij
+# @example: jb_workspace_purge webstorm
+# @notes: This is a destructive maintenance command. It is intended for UI/session
+#   state cleanup and does not modify trust state directly.
+jb_workspace_purge() {
+  local ide="$1"
+  _jb_validate_ide "$ide" || return 1
+
+  local ide_upper="${(U)ide}"
+  local root
+  root="$(_jb_resolve_path "$ide")" || return 1
+
+  local dir="$root/workspace"
+
+  [[ -d "$dir" ]] || {
+    echo "${YELLOW}No workspace directory found for $ide${RESET}"
+    return 1
+  }
+
+  _jb_warn_destructive "$ide" "Purge workspace" "$dir"
+  sleep 1
+
+  _jb_confirm_purge "$ide_upper" || return 1
+
+  rm -rf "$dir"/*
+
+  if _jb_verify_empty_dir "$dir"; then
+    echo "${GREEN}✅ Workspace purged${RESET}"
+    echo "${GREEN}✅ Verified: directory is empty${RESET}"
+  else
+    echo "${RED}❌ Verification failed: directory not empty${RESET}"
+    return 1
+  fi
+}
+
+# @synopsis: Open IntelliJ in the Java training root or a Java training subpath
+# @description: Launches IntelliJ IDEA at ~/dev/training/java by default. If a
+#   relative subpath is supplied, the subpath is appended beneath that root.
+# @parameter subpath: Optional relative path below ~/dev/training/java.
+# @example: ij_train_java
+# @example: ij_train_java fundamentals
+# @notes: This is intended for Java and Spring training work.
+ij_train_java() {
+  open -a "IntelliJ IDEA" "$HOME/dev/training/java/${1:-}"
+}
+
+# @synopsis: Open IntelliJ in the Java projects root or a Java projects subpath
+# @description: Launches IntelliJ IDEA at ~/dev/projects/java by default. If a
+#   relative subpath is supplied, the subpath is appended beneath that root.
+# @parameter subpath: Optional relative path below ~/dev/projects/java.
+# @example: ij_proj_java
+# @example: ij_proj_java coop-grade-management-system
+# @notes: This is intended for non-training Java project work.
+ij_proj_java() {
+  open -a "IntelliJ IDEA" "$HOME/dev/projects/java/${1:-}"
+}
+
+# @synopsis: Open PyCharm in the Python training root or a Python training subpath
+# @description: Launches PyCharm at ~/dev/training/python by default. If a relative
+#   subpath is supplied, the subpath is appended beneath that root.
+# @parameter subpath: Optional relative path below ~/dev/training/python.
+# @example: py_train
+# @example: py_train fundamentals
+# @notes: This is intended for Python training work.
+py_train() {
+  open -a "PyCharm" "$HOME/dev/training/python/${1:-}"
+}
+
+# @synopsis: Open PyCharm in the Python projects root or a Python projects subpath
+# @description: Launches PyCharm at ~/dev/projects/python by default. If a relative
+#   subpath is supplied, the subpath is appended beneath that root.
+# @parameter subpath: Optional relative path below ~/dev/projects/python.
+# @example: py_proj
+# @example: py_proj my_project
+# @notes: This is intended for non-training Python project work.
+py_proj() {
+  open -a "PyCharm" "$HOME/dev/projects/python/${1:-}"
+}
+
+# @synopsis: Open WebStorm in the web training root or a web training subpath
+# @description: Launches WebStorm at ~/dev/training/web by default. If a relative
+#   subpath is supplied, the subpath is appended beneath that root.
+# @parameter subpath: Optional relative path below ~/dev/training/web.
+# @example: web_train
+# @example: web_train javascript/fundamentals
+# @notes: This is intended for web training work.
+web_train() {
+  open -a "WebStorm" "$HOME/dev/training/web/${1:-}"
+}
+
+# @synopsis: Open WebStorm in the web projects root or a web projects subpath
+# @description: Launches WebStorm at ~/dev/projects/web by default. If a relative
+#   subpath is supplied, the subpath is appended beneath that root.
+# @parameter subpath: Optional relative path below ~/dev/projects/web.
+# @example: web_proj
+# @example: web_proj html-css
+# @notes: This is intended for non-training web project work.
+web_proj() {
+  open -a "WebStorm" "$HOME/dev/projects/web/${1:-}"
+}

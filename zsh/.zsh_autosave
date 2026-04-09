@@ -1,0 +1,365 @@
+# @module: zsh_autosave
+# @version: 0.1.0
+# @updated: 2026-04-08
+# @purpose: Obsidian autosave and autocommit helpers backed by a LaunchAgent.
+
+# ===============================================
+#  ~/.zsh_autosave — Obsidian autosave helpers
+#
+#  Purpose:
+#  - Manage the Obsidian vault autosave/autocommit workflow
+#  - Control the LaunchAgent schedule, verbosity, and jitter
+#  - Surface status and diagnostics in an interactive shell
+#
+#  Scheduled job notes:
+#  - LaunchAgent label:
+#      com.dt.obsidian-autosave
+#  - LaunchAgent plist:
+#      ~/Library/LaunchAgents/com.dt.obsidian-autosave.plist
+#  - Backing script:
+#      ~/Library/Application Support/DT_Automations/zsh/git_autosave.sh
+#  - Preferences file:
+#      ~/Library/Application Support/DT_Automations/config/autosave_prefs
+#  - Logs:
+#      /tmp/obsidian-autosave.out
+#      /tmp/obsidian-autosave.err
+#
+#  Important:
+#  - Changing the LaunchAgent label, plist path, script path, or prefs path
+#    can break the scheduled autosave job.
+#  - Internal/private helpers are prefixed with "_" and are not intended
+#    for direct interactive use.
+# ===============================================
+
+# ---- Paths & constants ----
+: "${DT_AUTOSAVE_PREFS:=$HOME/Library/Application Support/DT_Automations/config/autosave_prefs}"
+: "${DT_AUTOSAVE_LABEL:=com.dt.obsidian-autosave}"
+: "${DT_AUTOSAVE_PLIST:=$HOME/Library/LaunchAgents/$DT_AUTOSAVE_LABEL.plist}"
+: "${DT_AUTOSAVE_LOG_OUT:=/tmp/obsidian-autosave.out}"
+: "${DT_AUTOSAVE_LOG_ERR:=/tmp/obsidian-autosave.err}"
+: "${DT_AUTOSAVE_BADGE:=}"   # prompt badge (shown on RPROMPT by theme)
+
+# ---- Ensure pref directory exists ----
+mkdir -p "${DT_AUTOSAVE_PREFS%/*}"
+
+# ---- Defaults for first-time creation ----
+_autosave_defaults() {
+  cat <<'EOFPREFS'
+enabled=off
+verbose=off
+schedule=aligned
+interval_secs=600
+jitter_secs=10
+EOFPREFS
+}
+
+# ---- Load prefs (create if missing) ----
+# Internal startup helper:
+# - Creates default prefs if missing
+# - Loads persisted autosave state into the shell
+# - Sets the prompt badge based on enabled/disabled state
+_autosave_prefs_load() {
+  if [[ ! -f "$DT_AUTOSAVE_PREFS" ]]; then
+    _autosave_defaults > "$DT_AUTOSAVE_PREFS"
+  fi
+  # shellcheck disable=SC1090
+  source "$DT_AUTOSAVE_PREFS"
+  if [[ "${enabled:-off}" == "on" ]]; then
+    export DT_AUTOSAVE_BADGE="%F{cyan}🕒 Auto%f"
+  else
+    export DT_AUTOSAVE_BADGE=""
+  fi
+}
+
+# ---- Save prefs (idempotent key writer) ----
+_autosave_write_pref() {
+  local key="$1" val="$2"
+  touch "$DT_AUTOSAVE_PREFS"
+  if grep -q "^${key}=" "$DT_AUTOSAVE_PREFS"; then
+    sed -i '' -E "s|^(${key}=).*|\1${val}|" "$DT_AUTOSAVE_PREFS"
+  else
+    printf "%s=%s\n" "$key" "$val" >> "$DT_AUTOSAVE_PREFS"
+  fi
+}
+
+# ---- Helpers for LaunchAgent env vars ----
+_autosave_set_env_plist() {
+  local k="$1" v="$2"
+  /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables dict" "$DT_AUTOSAVE_PLIST" 2>/dev/null || true
+  /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:${k} string ${v}" "$DT_AUTOSAVE_PLIST" 2>/dev/null || \
+  /usr/libexec/PlistBuddy -c "Set :EnvironmentVariables:${k} ${v}" "$DT_AUTOSAVE_PLIST"
+}
+_autosave_del_env_plist() {
+  /usr/libexec/PlistBuddy -c "Delete :EnvironmentVariables:${1}" "$DT_AUTOSAVE_PLIST" 2>/dev/null || true
+}
+_autosave_reload_agent() {
+  launchctl bootout "gui/$(id -u)" "$DT_AUTOSAVE_PLIST" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$DT_AUTOSAVE_PLIST"
+  launchctl enable "gui/$(id -u)/$DT_AUTOSAVE_LABEL"
+  launchctl kickstart -k "gui/$(id -u)/$DT_AUTOSAVE_LABEL"
+}
+
+# @synopsis: Turn autosave status on in shell preferences
+# @description: Sets the autosave enabled flag to on in the persisted preferences
+#   file and updates the shell prompt badge to show autosave as active.
+# @example: autosave_status_on
+# @notes: This changes shell-level state and persisted preferences, not the LaunchAgent schedule.
+autosave_status_on()  { _autosave_write_pref enabled on;  export DT_AUTOSAVE_BADGE="%F{cyan}🕒 Auto%f"; echo "📊 Autosave status: ON"; }
+
+# @synopsis: Turn autosave status off in shell preferences
+# @description: Sets the autosave enabled flag to off in the persisted preferences
+#   file and removes the shell prompt badge.
+# @example: autosave_status_off
+# @notes: This changes shell-level state and persisted preferences, not the LaunchAgent schedule.
+autosave_status_off() { _autosave_write_pref enabled off; export DT_AUTOSAVE_BADGE="";                echo "📊 Autosave status: OFF"; }
+
+# @synopsis: Enable verbose autosave logging
+# @description: Enables verbose mode in the autosave LaunchAgent environment,
+#   reloads the agent, and increases logging detail for troubleshooting.
+# @example: autosave_verbose_on
+# @notes: Use autosave_tail or autosave_showlog to inspect output after enabling verbosity.
+autosave_verbose_on()  { _autosave_write_pref verbose on;  _autosave_set_env_plist AUTOSAVE_VERBOSE 1; _autosave_reload_agent; echo "🔊 Verbose logging ON → tail -f $DT_AUTOSAVE_LOG_OUT"; }
+
+# @synopsis: Disable verbose autosave logging
+# @description: Disables verbose mode in the autosave LaunchAgent environment
+#   and reloads the agent.
+# @example: autosave_verbose_off
+# @notes: Useful after finishing diagnostics to reduce log noise.
+autosave_verbose_off() { _autosave_write_pref verbose off; _autosave_del_env_plist AUTOSAVE_VERBOSE;  _autosave_reload_agent; echo "🤫 Verbose logging OFF"; }
+
+# @synopsis: Configure autosave schedule
+# @description: Sets the LaunchAgent to either an aligned schedule
+#   (:00/:10/:20/:30/:40/:50) or a fixed interval in seconds, then reloads the agent.
+# @parameter mode: Either aligned or interval.
+# @parameter seconds: Optional when mode is interval; specifies the number of seconds between runs.
+# @example: autosave_schedule aligned
+# @example: autosave_schedule interval 600
+# @notes: This directly edits the LaunchAgent plist and reloads the scheduled job.
+autosave_schedule() {
+  local mode="$1"
+  case "$mode" in
+    aligned)
+      /usr/libexec/PlistBuddy -c "Delete :StartInterval" "$DT_AUTOSAVE_PLIST" 2>/dev/null || true
+      /usr/libexec/PlistBuddy -c "Delete :StartCalendarInterval" "$DT_AUTOSAVE_PLIST" 2>/dev/null || true
+      /usr/libexec/PlistBuddy -c "Add :StartCalendarInterval array" "$DT_AUTOSAVE_PLIST"
+      for m in 0 10 20 30 40 50; do
+        /usr/libexec/PlistBuddy -c "Add :StartCalendarInterval:0 dict" "$DT_AUTOSAVE_PLIST"
+        /usr/libexec/PlistBuddy -c "Add :StartCalendarInterval:0:Minute integer $m" "$DT_AUTOSAVE_PLIST"
+      done
+      _autosave_write_pref schedule aligned
+      echo "⏱  Scheduled at :00/:10/:20/:30/:40/:50."
+      ;;
+    interval)
+      local secs="${2:-600}"
+      if ! [[ "$secs" =~ ^[0-9]+$ ]]; then
+        echo "❌ Provide seconds, e.g.: autosave_schedule interval 600"
+        return 1
+      fi
+      /usr/libexec/PlistBuddy -c "Delete :StartCalendarInterval" "$DT_AUTOSAVE_PLIST" 2>/dev/null || true
+      /usr/libexec/PlistBuddy -c "Delete :StartInterval" "$DT_AUTOSAVE_PLIST" 2>/dev/null || true
+      /usr/libexec/PlistBuddy -c "Add :StartInterval integer $secs" "$DT_AUTOSAVE_PLIST"
+      _autosave_write_pref schedule interval
+      _autosave_write_pref interval_secs "$secs"
+      echo "🔁 Scheduled every $secs seconds."
+      ;;
+    *)
+      echo "Usage:"
+      echo "  autosave_schedule aligned"
+      echo "  autosave_schedule interval 600"
+      return 1
+      ;;
+  esac
+  _autosave_reload_agent
+  echo "✅ Reloaded $DT_AUTOSAVE_LABEL"
+}
+
+# @synopsis: Set autosave jitter in seconds
+# @description: Updates the JITTER_SECONDS environment variable used by the LaunchAgent,
+#   persists the value, reloads the agent, and confirms the new jitter setting.
+# @parameter seconds: Number of seconds of jitter to apply.
+# @example: autosave_jitter_set 10
+# @notes: Jitter can help stagger runs and reduce exact-time collisions.
+autosave_jitter_set() {
+  local secs="${1:-10}"
+  if ! [[ "$secs" =~ ^[0-9]+$ ]]; then
+    echo "❌ Provide seconds, e.g.: autosave_jitter_set 10"; return 1
+  fi
+  _autosave_write_pref jitter_secs "$secs"
+  _autosave_set_env_plist JITTER_SECONDS "$secs"
+  _autosave_reload_agent
+  echo "🎯 Jitter set to $secs seconds."
+}
+
+# @synopsis: Show the next aligned autosave run time
+# @description: Calculates and prints the next aligned autosave time based on the
+#   :00/:10/:20/:30/:40/:50 schedule model.
+# @example: next_autosave
+# @notes: This is a convenience helper for aligned schedules; interval mode is not fully represented here.
+next_autosave() {
+  local now_min now_hour now_date target_min target_hour tm epoch
+  now_min=$(date +%M); now_hour=$(date +%H); now_date=$(date +%Y-%m-%d)
+  local mins=(0 10 20 30 40 50); target_min=""; target_hour=$now_hour
+  for m in "${mins[@]}"; do
+    if (( 10#$now_min < m )); then target_min=$m; break; fi
+  done
+  if [[ -z "$target_min" ]]; then
+    target_min=0; target_hour=$(( (10#$now_hour + 1) % 24 ))
+    (( 10#$now_hour == 23 )) && now_date=$(date -j -v+1d +%Y-%m-%d)
+  fi
+  tm="${now_date} ${target_hour}:$(printf '%02d' "$target_min"):00"
+  epoch=$(date -j -f "%Y-%m-%d %H:%M:%S" "$tm" +%s 2>/dev/null)
+  [[ -n "$epoch" ]] && date -r "$epoch" "+Next autosave: %Y-%m-%d %H:%M:%S" || echo "Next autosave: $tm"
+}
+
+# @synopsis: Show autosave agent health and quick diagnostics
+# @description: Prints LaunchAgent state, last exit code, the most recent vault commit,
+#   and the next aligned autosave run.
+# @example: autosave_health
+# @notes: Useful for confirming that the scheduled job is loaded and behaving as expected.
+autosave_health() {
+  echo "• Agent status:"
+  launchctl print "gui/$(id -u)/$DT_AUTOSAVE_LABEL" 2>/dev/null | grep -E "state =|last exit code" || echo "  (not loaded)"
+  echo
+  echo "• Last commit:"
+  git -C "$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Obsidian_DT_Vault" log --oneline -n 1 || true
+  echo
+  echo "• Next aligned run:"
+  next_autosave 2>/dev/null || echo "(helper not loaded?)"
+}
+
+# @synopsis: Delete current autosave log files
+# @description: Removes the current autosave stdout and stderr log files from /tmp.
+# @example: autosave_cleanlogs
+# @notes: New logs will be recreated by subsequent runs of the scheduled job.
+autosave_cleanlogs()  { rm -f "$DT_AUTOSAVE_LOG_OUT" "$DT_AUTOSAVE_LOG_ERR"; echo "🧹 Logs removed. Tail again with: tail -f $DT_AUTOSAVE_LOG_OUT"; }
+
+# @synopsis: Rotate autosave logs and zero current files
+# @description: Moves current autosave logs to timestamped backup files and recreates
+#   fresh zero-length current log files.
+# @example: autosave_rotatelogs
+# @notes: Useful when preserving historical logs before a fresh troubleshooting run.
+autosave_rotatelogs() {
+  local ts=$(date +%Y%m%d-%H%M%S)
+  [[ -f "$DT_AUTOSAVE_LOG_OUT" ]] && mv "$DT_AUTOSAVE_LOG_OUT" "${DT_AUTOSAVE_LOG_OUT}.${ts}"
+  [[ -f "$DT_AUTOSAVE_LOG_ERR" ]] && mv "$DT_AUTOSAVE_LOG_ERR" "${DT_AUTOSAVE_LOG_ERR}.${ts}"
+  : > "$DT_AUTOSAVE_LOG_OUT"; : > "$DT_AUTOSAVE_LOG_ERR"
+  echo "🔁 Rotated logs to timestamped files (*.${ts}) and zeroed current logs."
+}
+
+# ---- Load prefs at shell startup ----
+_autosave_prefs_load
+
+# @synopsis: Show the last lines of autosave logs
+# @description: Displays the last 40 lines of the autosave stdout and stderr logs.
+# @example: autosave_showlog
+# @notes: Good first step when diagnosing autosave behavior.
+autosave_showlog() {
+  local OUT=/tmp/obsidian-autosave.out ERR=/tmp/obsidian-autosave.err
+  echo "---- ${OUT} (last 40) ----"; tail -n 40 "$OUT" 2>/dev/null || echo "(no out log)"
+  echo
+  echo "---- ${ERR} (last 40) ----"; tail -n 40 "$ERR" 2>/dev/null || echo "(no err log)"
+}
+
+# @synopsis: Tail the autosave stdout log live
+# @description: Follows the autosave stdout log in real time until interrupted.
+# @example: autosave_tail
+# @notes: Press Ctrl-C to stop tailing.
+autosave_tail() {
+  local OUT=/tmp/obsidian-autosave.out
+  echo "Tailing $OUT (Ctrl-C to stop)…"
+  tail -f "$OUT"
+}
+
+# @synopsis: Show the current autosave configuration
+# @description: Displays the current LaunchAgent configuration, script path, vault path,
+#   prompt badge state, verbosity, schedule, jitter, next run, and last commit.
+# @example: autosave_config
+# @notes: This is the main overview command for understanding the autosave system state.
+autosave_config() {
+  local PLIST="$HOME/Library/LaunchAgents/com.dt.obsidian-autosave.plist"
+  local LABEL="com.dt.obsidian-autosave"
+  local SCRIPT="$HOME/Library/Application Support/DT_Automations/zsh/git_autosave.sh"
+  local VAULT="$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Obsidian_DT_Vault"
+
+  # --- basic existence ---
+  local has_plist="No"
+  [[ -f "$PLIST" ]] && has_plist="Yes"
+
+  # --- agent state / last exit code ---
+  local state="(unknown)" last="(unknown)"
+  local p
+  p=$(launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null)
+  if [[ -n "$p" ]]; then
+    state=$(print -r -- "$p" | grep -E '^\s*state = ' | tail -n1 | awk -F'= ' '{print $2}')
+    last=$(print -r -- "$p" | grep -E '^\s*last exit code = ' | tail -n1 | awk -F'= ' '{print $2}')
+  fi
+
+  # --- plist EnvironmentVariables ---
+  local verbose="Off" jitter="0"
+  local ev
+  ev=$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables" "$PLIST" 2>/dev/null)
+  if [[ -n "$ev" ]]; then
+    # AUTOSAVE_VERBOSE
+    if /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:AUTOSAVE_VERBOSE" "$PLIST" &>/dev/null; then
+      local vv; vv=$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:AUTOSAVE_VERBOSE" "$PLIST" 2>/dev/null)
+      [[ "$vv" = "1" || "$vv" = "true" ]] && verbose="On"
+    fi
+    # JITTER_SECONDS
+    if /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:JITTER_SECONDS" "$PLIST" &>/dev/null; then
+      jitter=$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:JITTER_SECONDS" "$PLIST" 2>/dev/null)
+    fi
+  fi
+
+  # --- schedule detection ---
+  local schedule="(unknown)"
+  if /usr/libexec/PlistBuddy -c "Print :StartInterval" "$PLIST" &>/dev/null; then
+    local secs; secs=$(/usr/libexec/PlistBuddy -c "Print :StartInterval" "$PLIST" 2>/dev/null)
+    schedule="Interval (${secs}s)"
+  elif /usr/libexec/PlistBuddy -c "Print :StartCalendarInterval" "$PLIST" &>/dev/null; then
+    # Try to read Minute entries; if many, summarize
+    local mins; mins=$(/usr/libexec/PlistBuddy -c "Print :StartCalendarInterval" "$PLIST" 2>/dev/null | grep -E 'Minute =' | awk '{print $3}' | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+    if [[ -n "$mins" ]]; then
+      schedule="Aligned (minutes: ${mins})"
+    else
+      schedule="Aligned (calendar-based)"
+    fi
+  fi
+
+  # --- badge status (prompt indicator) ---
+  local badge="OFF"
+  [[ -n "${DT_AUTOSAVE_BADGE:-}" ]] && badge="ON"
+
+  # --- last commit ---
+  local last_commit
+  if [[ -d "$VAULT/.git" ]]; then
+    last_commit=$(git -C "$VAULT" log --oneline -n 1 2>/dev/null)
+    [[ -z "$last_commit" ]] && last_commit="(no commits yet)"
+  else
+    last_commit="(vault is not a git repo)"
+  fi
+
+  # --- next run (if helper exists) ---
+  local next="(helper not loaded)"
+  if whence next_autosave &>/dev/null; then
+    next=$(next_autosave 2>/dev/null)
+  fi
+
+  # --- print report ---
+  echo "⚙️  Obsidian Autosave Configuration"
+  echo "────────────────────────────────────────────"
+  echo "Vault Path : $VAULT"
+  echo "Agent      : $LABEL"
+  echo "Plist OK   : $has_plist"
+  echo "Script     : $SCRIPT"
+  echo
+  echo "Agent State: $state   (last exit: $last)"
+  echo "Badge      : $badge"
+  echo "Verbose    : $verbose"
+  echo "Schedule   : $schedule"
+  echo "Jitter     : ${jitter}s"
+  echo
+  echo "Next Run   : $next"
+  echo "Last Commit: ${last_commit}"
+  echo "────────────────────────────────────────────"
+  echo "Tips: autosave_schedule aligned | interval 600 • autosave_verbose_on/off • autosave_jitter_set 10"
+}
