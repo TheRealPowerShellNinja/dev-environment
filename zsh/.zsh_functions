@@ -1,0 +1,264 @@
+# @module: zsh_functions
+# @version: 0.1.5
+# @updated: 2026-04-08
+# @purpose: Generic reusable Zsh helper functions and dynamic discoverability helpers.
+
+# ===============================================
+#  ~/.zsh_functions — Generic reusable helpers
+#
+#  Purpose:
+#  - Provide generic shell helpers that are not tied to one project
+#  - Provide dynamic function discovery similar to PowerShell
+#  - Read help metadata from ~/.zsh_* files
+#
+#  Notes:
+#  - This file is intentionally generic.
+#  - Domain-specific logic should live in separate files such as:
+#      ~/.zsh_jetbrains
+#      ~/.zsh_obsidian_core
+#      ~/.zsh_autosave
+#      ~/.zsh_git
+#      ~/.zsh_system
+# ===============================================
+
+AWK=/usr/bin/awk
+SORT=/usr/bin/sort
+
+# @synopsis: List discoverable public Zsh functions from ~/.zsh_* files
+# @description: Scans Zsh module files in the home directory, finds public functions,
+#   and prints each function with its one-line synopsis. Internal helpers and shell
+#   lifecycle hooks are excluded.
+# @example: fn_list
+# @notes: A public function should have an @synopsis comment immediately above it.
+fn_list() {
+  local -a files
+  files=(
+    ~/.zsh_functions
+    ~/.zsh_aliases
+    ~/.zsh_autosave
+    ~/.zsh_jetbrains
+    ~/.zsh_obsidian_core
+    ~/.zsh_git
+    ~/.zsh_system
+    ~/.zsh_theme
+  )
+
+  local file
+  for file in "${files[@]}"; do
+    [[ -f "$file" ]] || continue
+
+    "$AWK" '
+      BEGIN {
+        synopsis = ""
+      }
+
+      /^# @synopsis: / {
+        synopsis = substr($0, 14)
+        next
+      }
+
+      /^[[:space:]]*[A-Za-z0-9_]+\(\)[[:space:]]*\{/ {
+        line = $0
+        sub(/^[[:space:]]*/, "", line)
+        sub(/\(\)[[:space:]]*\{.*/, "", line)
+
+        # Skip internal helpers and shell hooks
+        if (line ~ /^_/) { synopsis = ""; next }
+        if (line ~ /__/) { synopsis = ""; next }
+        if (line == "precmd" || line == "preexec" || line == "chpwd" || line == "periodic" || line == "zshaddhistory") {
+          synopsis = ""
+          next
+        }
+
+        if (synopsis == "") {
+          printf "%-20s %s\n", line, "(no synopsis)"
+        } else {
+          printf "%-20s %s\n", line, synopsis
+        }
+
+        synopsis = ""
+      }
+    ' "$file"
+  done | "$SORT" -u
+}
+
+# @synopsis: Show PowerShell-style help for one or more discoverable Zsh functions
+# @description: Scans ~/.zsh_* files for each requested function and prints any
+#   structured metadata found above it, including synopsis, description,
+#   parameters, examples, and notes.
+# @parameter name: One or more function names to inspect.
+# @example: fn_help fn_list
+# @example: fn_help autosave_config ij_train_java
+# @notes: This reads source files, not the in-memory shell definition, because
+#   comments are not preserved when functions are loaded into Zsh.
+fn_help() {
+  local -a names
+  names=("$@")
+
+  [[ ${#names[@]} -gt 0 ]] || {
+    echo "Usage: fn_help <function_name> [function_name...]"
+    return 1
+  }
+
+  local -a files
+  files=(
+    ~/.zsh_functions
+    ~/.zsh_aliases
+    ~/.zsh_autosave
+    ~/.zsh_jetbrains
+    ~/.zsh_obsidian_core
+    ~/.zsh_git
+    ~/.zsh_system
+    ~/.zsh_theme
+  )
+
+  local total=${#names[@]}
+  local index=1
+  local name file found_any
+
+  # Optional polish: blank line before the first help block
+  echo
+
+  for name in "${names[@]}"; do
+    found_any=0
+
+    for file in "${files[@]}"; do
+      [[ -f "$file" ]] || continue
+
+      "$AWK" -v target="$name" '
+        BEGIN {
+          synopsis = ""
+          description = ""
+          found = 0
+          in_desc = 0
+          param_count = 0
+          example_count = 0
+          note_count = 0
+        }
+
+        /^# @synopsis: / {
+          synopsis = substr($0, 14)
+          next
+        }
+
+        /^# @description: / {
+          text = substr($0, 17)
+          if (description == "") description = text
+          else description = description " " text
+          in_desc = 1
+          next
+        }
+
+        in_desc == 1 && /^#   / {
+          text = substr($0, 5)
+          description = description " " text
+          next
+        }
+
+        in_desc == 1 && /^# @/ {
+          in_desc = 0
+        }
+
+        /^# @parameter / {
+          params[++param_count] = substr($0, 14)
+          next
+        }
+
+        /^# @example: / {
+          examples[++example_count] = substr($0, 12)
+          next
+        }
+
+        /^# @notes: / {
+          notes[++note_count] = substr($0, 10)
+          next
+        }
+
+        /^[[:space:]]*[A-Za-z0-9_]+\(\)[[:space:]]*\{/ {
+          line = $0
+          sub(/^[[:space:]]*/, "", line)
+          sub(/\(\)[[:space:]]*\{.*/, "", line)
+
+          if (line == target) {
+            found = 1
+
+            print "NAME"
+            print "    " line
+            print ""
+
+            if (synopsis != "") {
+              print "SYNOPSIS"
+              print "    " synopsis
+              print ""
+            }
+
+            if (description != "") {
+              print "DESCRIPTION"
+              print "    " description
+              print ""
+            }
+
+            if (param_count > 0) {
+              print "PARAMETERS"
+              for (i = 1; i <= param_count; i++) {
+                print "    " params[i]
+              }
+              print ""
+            }
+
+            if (example_count > 0) {
+              print "EXAMPLES"
+              for (i = 1; i <= example_count; i++) {
+                print "    " examples[i]
+              }
+              print ""
+            }
+
+            if (note_count > 0) {
+              print "NOTES"
+              for (i = 1; i <= note_count; i++) {
+                print "    " notes[i]
+              }
+              print ""
+            }
+
+            exit 0
+          }
+
+          synopsis = ""
+          description = ""
+          in_desc = 0
+          delete params
+          delete examples
+          delete notes
+          param_count = 0
+          example_count = 0
+          note_count = 0
+        }
+
+        END {
+          if (!found) exit 1
+        }
+      ' "$file"
+
+      if [[ $? -eq 0 ]]; then
+        echo "SOURCE"
+        echo "    $file"
+        found_any=1
+        break
+      fi
+    done
+
+    [[ $found_any -eq 0 ]] && echo "❌ Function not found: $name"
+
+    if (( total > 1 && index < total )); then
+      echo
+      echo "----------------------------------------"
+      echo
+    else
+      echo
+    fi
+
+    ((index++))
+  done
+}
